@@ -1,0 +1,12 @@
+[package]
+name = "keyrun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+appcfg = { git = "https://github.com/sulabi/appcfg", features = ["system-dirs", "watcher"] }
+# appcfg = { path = "../appcfg/", features = ["system-dirs", "watcher"] }
+evdev = "0.13.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
