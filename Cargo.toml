@@ -2,6 +2,8 @@
 name = "keyrun"
 version = "0.1.0"
 edition = "2024"
+description = "linux keybased app launcher"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
