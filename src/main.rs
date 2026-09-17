@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use appcfg::{Config, ConfigDirectory, ConfigError};
+use configfs::{Config, ConfigDirectory, ConfigError};
 use evdev::{Device, EventSummary, InputEvent, KeyCode, uinput::VirtualDevice};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs::OpenOptions, time::Duration};
