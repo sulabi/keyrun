@@ -11,6 +11,7 @@ configfs = { version = "0.2.2", features = ["system-dirs"] }
 evdev = "0.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
+udev = "0.9.3"
 
 [dev-dependencies.cargo-husky]
 version = "1"

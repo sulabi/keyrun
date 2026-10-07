@@ -3,7 +3,9 @@ use configfs::{Config, ConfigDirectory};
 use evdev::{AttributeSet, Device, EventSummary, EventType, KeyCode, uinput::VirtualDevice};
 use serde::{Deserialize, Serialize};
 use std::thread;
+use std::time::Instant;
 use std::{collections::HashMap, fs::OpenOptions, sync::mpsc, time::Duration};
+use udev::Device as UDevDevice;
 
 mod command;
 use command::*;
@@ -130,9 +132,22 @@ fn main() -> Result<()> {
 
     let mut vdev = build_virtual_device(&keyboards)?;
 
-    std::thread::sleep(Duration::from_millis(200));
+    let sys_path = vdev.get_syspath()?;
+    let now = Instant::now();
+    for _ in 0..50 {
+        if let Ok(d) = UDevDevice::from_syspath(&sys_path)
+            && d.is_initialized()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "Took {}ms to initlaize virtual keyboard",
+        now.elapsed().as_millis()
+    );
 
-    for keyboard in &mut keyboards {
+    for keyboard in keyboards.iter_mut() {
         keyboard.grab()?;
     }
 
