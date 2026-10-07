@@ -84,28 +84,15 @@ fn acquire_singleton_lock() -> Result<std::fs::File> {
     Ok(file)
 }
 
-const EXIT_TIMEOUT_MS: u64 = 2000;
+fn key_to_char(key: KeyCode) -> Option<char> {
+    let name = format!("{key:?}");
+    name.strip_prefix("KEY_")?
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_lowercase())
+}
 
-fn main() -> Result<()> {
-    let _lock = match acquire_singleton_lock() {
-        Ok(f) => f,
-        Err(_) => std::process::exit(0),
-    };
-
-    thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(EXIT_TIMEOUT_MS));
-        std::process::exit(1);
-    });
-
-    let config: Config<KeyConfig> = Config::new(ConfigDirectory::System("keyrun"))?;
-    let config_keys = config.read()?.keys;
-
-    let mut keyboards = get_keyboards();
-
-    if keyboards.is_empty() {
-        anyhow::bail!("No keyboards found");
-    }
-
+fn build_virtual_device(keyboards: &[Device]) -> Result<VirtualDevice> {
     let keys = keyboards
         .iter()
         .filter_map(|kb| kb.supported_keys())
@@ -113,10 +100,35 @@ fn main() -> Result<()> {
         .collect::<AttributeSet<KeyCode>>();
 
     let vdev_name = "sink-passthrough-kbd";
-    let mut vdev = VirtualDevice::builder()?
+    let vdev = VirtualDevice::builder()?
         .name(vdev_name)
         .with_keys(&keys)?
         .build()?;
+
+    Ok(vdev)
+}
+
+const EXIT_TIMEOUT: Duration = Duration::from_millis(2000);
+
+fn main() -> Result<()> {
+    let Ok(_lock) = acquire_singleton_lock() else {
+        return Ok(());
+    };
+
+    thread::spawn(move || {
+        thread::sleep(EXIT_TIMEOUT);
+        std::process::exit(1);
+    });
+
+    let config: Config<KeyConfig> = Config::new(ConfigDirectory::System("keyrun"))?;
+    let config_keys = config.read()?.keys;
+
+    let mut keyboards = get_keyboards();
+    if keyboards.is_empty() {
+        anyhow::bail!("No keyboards found");
+    }
+
+    let mut vdev = build_virtual_device(&keyboards)?;
 
     std::thread::sleep(Duration::from_millis(200));
 
@@ -125,8 +137,6 @@ fn main() -> Result<()> {
     }
 
     println!("Listening for keyboard events...");
-
-    let mut batch = Vec::new();
 
     let (tx, rx) = mpsc::channel();
 
@@ -152,6 +162,10 @@ fn main() -> Result<()> {
         });
     }
 
+    drop(tx);
+
+    let mut batch = Vec::new();
+
     for event in rx {
         match event.destructure() {
             EventSummary::Synchronization(..) => {
@@ -161,19 +175,13 @@ fn main() -> Result<()> {
                 }
             }
             EventSummary::Key(_, key, 1) => {
-                if let Some(key_str) = format!("{:?}", key)
-                    .strip_prefix("KEY_")
-                    .map(|k| k.to_lowercase())
+                if let Some(key_char) = key_to_char(key)
+                    && let Some(key_cmd) = config_keys.get(&key_char)
+                    && let Ok(mut app) = key_cmd.build()
                 {
-                    let key_char: char = key_str.parse()?;
-
-                    if let Some(key_cmd) = config_keys.get(&key_char)
-                        && let Ok(mut app) = key_cmd.build()
-                    {
-                        let _ = app.spawn();
-                    }
-                    std::process::exit(0);
+                    let _ = app.spawn();
                 }
+                std::process::exit(0);
             }
             _ => batch.push(event),
         }
