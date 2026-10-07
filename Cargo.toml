@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
-configfs = { version = "0.1.2", features = ["system-dirs"] }
+configfs = { version = "0.2.2", features = ["system-dirs"] }
 evdev = "0.13.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"

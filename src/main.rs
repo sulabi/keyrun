@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use configfs::{Config, ConfigDirectory, ConfigError};
-use evdev::{Device, EventSummary, InputEvent, KeyCode, uinput::VirtualDevice};
+use configfs::{Config, ConfigDirectory};
+use evdev::{AttributeSet, Device, EventSummary, EventType, KeyCode, uinput::VirtualDevice};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs::OpenOptions, time::Duration};
+use std::thread;
+use std::{collections::HashMap, fs::OpenOptions, sync::mpsc, time::Duration};
 
 mod command;
 use command::*;
@@ -55,32 +56,29 @@ impl KeyCommand {
         }
     }
 }
+fn is_keyboard(device: &Device) -> bool {
+    let events = device.supported_events();
+    events.contains(EventType::KEY)
+        && events.contains(EventType::REPEAT)
+        && device
+            .supported_keys()
+            .is_some_and(|keys| keys.contains(KeyCode::KEY_SPACE))
+}
 
-fn get_keyboard() -> Option<Device> {
+fn get_keyboards() -> Vec<Device> {
     evdev::enumerate()
-        .filter_map(|(_, device)| {
-            let keys = device.supported_keys()?;
-
-            if keys.contains(KeyCode::KEY_A)
-                && keys.contains(KeyCode::KEY_ENTER)
-                && keys.contains(KeyCode::KEY_SPACE)
-            {
-                Some(device)
-            } else {
-                None
-            }
-        })
-        .next()
+        .map(|(_, device)| device)
+        .filter(is_keyboard)
+        .collect()
 }
 
 fn acquire_singleton_lock() -> Result<std::fs::File> {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let path = format!("{dir}/keyrun.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(path)?;
+        .open(format!("{dir}/keyrun.lock"))?;
     file.try_lock()
         .context("Another keyrun instance is already waiting for a key")?;
     Ok(file)
@@ -94,68 +92,92 @@ fn main() -> Result<()> {
         Err(_) => std::process::exit(0),
     };
 
-    std::thread::spawn(|| {
+    thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(EXIT_TIMEOUT_MS));
         std::process::exit(1);
     });
 
-    let config_handle = std::thread::spawn(|| -> Result<KeyConfig, ConfigError> {
-        let config = Config::new(ConfigDirectory::System("keyrun"))?;
-        config.read::<KeyConfig>()
-    });
+    let config: Config<KeyConfig> = Config::new(ConfigDirectory::System("keyrun"))?;
+    let config_keys = config.read()?.keys;
 
-    let mut keyboard = match get_keyboard() {
-        Some(kb) => kb,
-        _ => {
-            println!("Couldn't get keyboard");
-            std::process::exit(1);
-        }
-    };
+    let mut keyboards = get_keyboards();
 
-    let keys = keyboard.supported_keys().context("No key capabilities")?;
+    if keyboards.is_empty() {
+        anyhow::bail!("No keyboards found");
+    }
+
+    let keys = keyboards
+        .iter()
+        .filter_map(|kb| kb.supported_keys())
+        .flat_map(|keys| keys.iter())
+        .collect::<AttributeSet<KeyCode>>();
 
     let vdev_name = "sink-passthrough-kbd";
     let mut vdev = VirtualDevice::builder()?
         .name(vdev_name)
-        .with_keys(keys)?
+        .with_keys(&keys)?
         .build()?;
 
     std::thread::sleep(Duration::from_millis(200));
 
-    keyboard.grab()?;
+    for keyboard in &mut keyboards {
+        keyboard.grab()?;
+    }
 
     println!("Listening for keyboard events...");
 
-    let mut batch: Vec<InputEvent> = Vec::new();
+    let mut batch = Vec::new();
 
-    loop {
-        for event in keyboard.fetch_events()? {
-            match event.destructure() {
-                EventSummary::Synchronization(..) => {
-                    if !batch.is_empty() {
-                        vdev.emit(&batch)?;
-                        batch.clear();
-                    }
-                }
-                EventSummary::Key(_, key, 1) => {
-                    if let Some(key_str) = format!("{:?}", key)
-                        .strip_prefix("KEY_")
-                        .map(|k| k.to_lowercase())
-                    {
-                        let key_char: char = key_str.parse()?;
+    let (tx, rx) = mpsc::channel();
 
-                        let data = config_handle.join().unwrap()?;
+    for mut keyboard in keyboards {
+        let tx = tx.clone();
 
-                        if let Some(key_cmd) = data.keys.get(&key_char)
-                            && let Ok(mut app) = key_cmd.build()
-                        {
-                            let _ = app.spawn();
+        thread::spawn(move || {
+            loop {
+                match keyboard.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if tx.send(event).is_err() {
+                                return;
+                            }
                         }
-                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("keyboard error: {e}");
+                        return;
                     }
                 }
-                _ => batch.push(event),
             }
+        });
+    }
+
+    for event in rx {
+        match event.destructure() {
+            EventSummary::Synchronization(..) => {
+                if !batch.is_empty() {
+                    vdev.emit(&batch)?;
+                    batch.clear();
+                }
+            }
+            EventSummary::Key(_, key, 1) => {
+                if let Some(key_str) = format!("{:?}", key)
+                    .strip_prefix("KEY_")
+                    .map(|k| k.to_lowercase())
+                {
+                    let key_char: char = key_str.parse()?;
+
+                    if let Some(key_cmd) = config_keys.get(&key_char)
+                        && let Ok(mut app) = key_cmd.build()
+                    {
+                        let _ = app.spawn();
+                    }
+                    std::process::exit(0);
+                }
+            }
+            _ => batch.push(event),
         }
     }
+
+    Ok(())
 }
