@@ -41,22 +41,26 @@ impl Default for ListenTimes {
     }
 }
 
-struct KeySession {
-    keys: Box<[char]>,
+struct KeySession<'a> {
+    key: char,
+    links: &'a [char],
     remaining: Option<usize>,
 }
 
-impl KeySession {
-    fn new(key: char, command: &KeyCommand) -> Self {
+impl<'a> KeySession<'a> {
+    fn new(key: char, command: &'a KeyCommand) -> Self {
         Self {
-            keys: std::iter::once(key)
-                .chain(command.links_with.iter().copied())
-                .collect(),
+            key,
+            links: &command.links_with,
             remaining: match command.times {
                 ListenTimes::Limited(count) => Some(count.get()),
                 ListenTimes::Unlimited(_) => None,
             },
         }
+    }
+
+    fn contains(&self, key: char) -> bool {
+        self.key == key || self.links.contains(&key)
     }
 
     fn pressed(&mut self) -> bool {
@@ -265,12 +269,10 @@ fn main() -> Result<()> {
 
             // press
             EventSummary::Key(_, key, 1) => {
-                println!("{:?}", key);
-
                 if !finished
                     && let Some(key_char) = key_to_char(key)
                     && let Some(key_cmd) = config_keys.get(&key_char)
-                    && session.as_ref().is_none_or(|s| s.keys.contains(&key_char))
+                    && session.as_ref().is_none_or(|s| s.contains(key_char))
                 {
                     if !sinked_keys.contains(&key) {
                         sinked_keys.push(key);
@@ -349,9 +351,9 @@ mod tests {
         )
         .unwrap();
         let mut session = KeySession::new('u', &config.keys[&'u']);
-        assert!(session.keys.contains(&'u'));
-        assert!(session.keys.contains(&'d'));
-        assert!(!session.keys.contains(&'x'));
+        assert!(session.contains('u'));
+        assert!(session.contains('d'));
+        assert!(!session.contains('x'));
         assert!(!session.pressed());
         assert!(!session.pressed());
         assert!(session.pressed());
