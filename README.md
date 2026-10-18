@@ -1,29 +1,45 @@
 # keyrun
 
-`keyrun` is a key based app launcher, it grabs your keyboard and waits for next key, to map it to a configured application.
+`keyrun` is a key based app launcher for Linux. The launcher grabs your keyboard and maps your key to a configured command.
 
-## Configuration
+Configure `~/.config/keyrun/config.toml`:
 
-`keyrun` reads a config file from `~/.config/keyrun/config.toml`. The config is written in a toml format for clear mappings.
-
-### Config example
 ```toml
-
-# Single app
 [keys.f]
 app = "firefox"
 
-# Example with args
-[keys.k]
-app = "notify-send"
-args = ["This", "example", "-t", "1000"]
+# Repeat brightness adjustments up to ten times
+[keys.b]
+app = "brightnessctl"
+args = ["set", "+5%"]
+times = 10
+
+# Switch between volume up/down until idle
+[keys.u]
+app = "wpctl"
+args = ["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]
+times = "infinite"
+links_with = ["d"]
+
+[keys.d]
+app = "wpctl"
+args = ["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"]
+times = "infinite"
+links_with = ["u"]
 ```
 
-## Note
-This requires your user to be apart of the `input` group in order for the `evdev` crate to grab your keyboard.
-You can add your current user to the group with
+- `times` defaults to `1`; use a positive integer or `"infinite"`.
+- The first mapped key sets the session's press limit and allowed `links_with` keys.
+  Each press runs its own command. List links on both sides to start from either key.
+- An unrelated key ends the session and passes through normally, including modifiers.
+  The listener waits for forwarded keys to be released so shortcuts work.
+- The listener also exits after two seconds without a mapped press, once forwarded
+  keys are released. Unmapped keys before a session starts pass through normally.
+
+Your user needs keyboard access through the `input` group:
+
 ```bash
-sudo usermod -aG input $USER
+sudo usermod -aG input "$USER"
 ```
 
-Then just log back in for the group permissions to take effect.
+Log out and back in for the group change to take effect.
