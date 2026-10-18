@@ -94,6 +94,20 @@ fn key_to_char(key: KeyCode) -> Option<char> {
         .map(|c| c.to_ascii_lowercase())
 }
 
+fn is_modifier(key: KeyCode) -> bool {
+    matches!(
+        key,
+        KeyCode::KEY_LEFTMETA
+            | KeyCode::KEY_RIGHTMETA
+            | KeyCode::KEY_LEFTSHIFT
+            | KeyCode::KEY_RIGHTSHIFT
+            | KeyCode::KEY_LEFTCTRL
+            | KeyCode::KEY_RIGHTCTRL
+            | KeyCode::KEY_LEFTALT
+            | KeyCode::KEY_RIGHTALT
+    )
+}
+
 fn build_virtual_device(keyboards: &[Device]) -> Result<VirtualDevice> {
     let keys = keyboards
         .iter()
@@ -122,13 +136,17 @@ fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let config: Config<KeyConfig> = Config::new(ConfigPath::System("keyrun"))?;
-    let config_keys = config.read()?.keys;
-
     let mut keyboards = get_keyboards();
     if keyboards.is_empty() {
         anyhow::bail!("No keyboards found");
     }
+
+    for keyboard in keyboards.iter_mut() {
+        keyboard.grab()?;
+    }
+
+    let config: Config<KeyConfig> = Config::new(ConfigPath::System("keyrun"))?;
+    let config_keys = config.read()?.keys;
 
     let mut vdev = build_virtual_device(&keyboards)?;
 
@@ -143,13 +161,9 @@ fn main() -> Result<()> {
         thread::sleep(Duration::from_millis(10));
     }
     println!(
-        "Took {}ms to initlaize virtual keyboard",
+        "Took {}ms to initialize virtual keyboard",
         now.elapsed().as_millis()
     );
-
-    for keyboard in keyboards.iter_mut() {
-        keyboard.grab()?;
-    }
 
     println!("Listening for keyboard events...");
 
@@ -189,7 +203,7 @@ fn main() -> Result<()> {
                     batch.clear();
                 }
             }
-            EventSummary::Key(_, key, 1) => {
+            EventSummary::Key(_, key, 1) if !is_modifier(key) => {
                 if let Some(key_char) = key_to_char(key)
                     && let Some(key_cmd) = config_keys.get(&key_char)
                     && let Ok(mut app) = key_cmd.build()
@@ -203,4 +217,28 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifiers_do_not_consume_the_command_key() {
+        for key in [
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_RIGHTALT,
+        ] {
+            assert!(is_modifier(key));
+        }
+        assert!(!is_modifier(KeyCode::KEY_F));
+        assert!(!is_modifier(KeyCode::KEY_X));
+        assert!(!is_modifier(KeyCode::KEY_ESC));
+    }
 }
