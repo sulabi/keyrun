@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use configfs::{Config, ConfigDirectory};
+use configfs::{Config, ConfigPath};
 use evdev::{AttributeSet, Device, EventSummary, EventType, KeyCode, uinput::VirtualDevice};
 use serde::{Deserialize, Serialize};
 use std::thread;
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let config: Config<KeyConfig> = Config::new(ConfigDirectory::System("keyrun"))?;
+    let config: Config<KeyConfig> = Config::new(ConfigPath::System("keyrun"))?;
     let config_keys = config.read()?.keys;
 
     let mut keyboards = get_keyboards();
