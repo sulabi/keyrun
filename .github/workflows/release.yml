@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Check release version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} must match Cargo.toml version v{version}")
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      - name: Build
+        run: cargo build --release --locked --features overlay
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/keyrun-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+            -C target/release keyrun \
+            -C "$GITHUB_WORKSPACE" LICENSE
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/keyrun-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+            assets/config.schema.json \
+            --verify-tag \
+            --title "keyrun ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --draft

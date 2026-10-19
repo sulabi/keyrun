@@ -1,0 +1,43 @@
+name: Rust
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy without overlay
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy with overlay
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test without overlay
+        run: cargo test --locked --no-default-features
+
+      - name: Test with overlay
+        run: cargo test --locked --all-features
