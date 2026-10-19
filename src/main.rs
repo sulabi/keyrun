@@ -1,11 +1,20 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use configfs::{Config, ConfigPath};
-use evdev::{AttributeSet, Device, EventSummary, EventType, KeyCode, uinput::VirtualDevice};
+use evdev::{EventSummary, KeyCode};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, fs::OpenOptions, sync::mpsc, thread, time::Duration, time::Instant,
+    collections::HashMap,
+    fs::OpenOptions,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
-use udev::Device as UDevDevice;
+
+#[cfg(feature = "overlay")]
+mod overlay;
+
+mod input;
+mod passthrough;
 
 mod command;
 use command::*;
@@ -35,6 +44,7 @@ enum ListenTimes {
     Limited(std::num::NonZeroUsize),
     Unlimited(Unlimited),
 }
+
 impl Default for ListenTimes {
     fn default() -> Self {
         ListenTimes::Limited(std::num::NonZeroUsize::new(1).unwrap())
@@ -73,12 +83,61 @@ impl<'a> KeySession<'a> {
     }
 }
 
-#[derive(Deserialize, Serialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct KeyConfig {
+    #[serde(default = "default_timeout_seconds")]
+    timeout_seconds: f64,
+    #[cfg(feature = "overlay")]
+    #[serde(default)]
+    overlay: overlay::OverlayConfig,
     keys: HashMap<char, KeyCommand>,
 }
 
+fn default_timeout_seconds() -> f64 {
+    1.
+}
+
+impl Default for KeyConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: default_timeout_seconds(),
+            #[cfg(feature = "overlay")]
+            overlay: overlay::OverlayConfig::default(),
+            keys: HashMap::new(),
+        }
+    }
+}
+
+impl KeyConfig {
+    fn timeout(&self) -> Result<Duration> {
+        let timeout = Duration::try_from_secs_f64(self.timeout_seconds)
+            .context("timeout_seconds must be a finite, positive number")?;
+
+        anyhow::ensure!(
+            !timeout.is_zero(),
+            "timeout_seconds must be greater than zero"
+        );
+        Instant::now()
+            .checked_add(timeout)
+            .context("timeout_seconds is too large")?;
+
+        Ok(timeout)
+    }
+}
+
 impl KeyCommand {
+    fn label(&self) -> String {
+        let command = std::iter::once(self.app.as_str())
+            .chain(self.args.iter().flatten().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        match &self.pipe {
+            Some(pipe) => format!("{command} | {}", pipe.label()),
+            None => command,
+        }
+    }
+
     pub fn build(&self) -> Result<Command> {
         let mut cmd = Command::new(&self.app);
 
@@ -101,21 +160,6 @@ impl KeyCommand {
         }
     }
 }
-fn is_keyboard(device: &Device) -> bool {
-    let events = device.supported_events();
-    events.contains(EventType::KEY)
-        && events.contains(EventType::REPEAT)
-        && device
-            .supported_keys()
-            .is_some_and(|keys| keys.contains(KeyCode::KEY_SPACE))
-}
-
-fn get_keyboards() -> Vec<Device> {
-    evdev::enumerate()
-        .map(|(_, device)| device)
-        .filter(is_keyboard)
-        .collect()
-}
 
 fn acquire_singleton_lock() -> Result<std::fs::File> {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -124,8 +168,10 @@ fn acquire_singleton_lock() -> Result<std::fs::File> {
         .truncate(true)
         .write(true)
         .open(format!("{dir}/keyrun.lock"))?;
+
     file.try_lock()
         .context("Another keyrun instance is already waiting for a key")?;
+
     Ok(file)
 }
 
@@ -141,40 +187,34 @@ fn key_to_char(key: KeyCode) -> Option<char> {
         .flatten()
 }
 
-fn build_virtual_device(keyboards: &[Device]) -> Result<VirtualDevice> {
-    let keys = keyboards
-        .iter()
-        .filter_map(|kb| kb.supported_keys())
-        .flat_map(|keys| keys.iter())
-        .collect::<AttributeSet<KeyCode>>();
-
-    let vdev_name = "sink-passthrough-kbd";
-
-    VirtualDevice::builder()?
-        .name(vdev_name)
-        .with_keys(&keys)?
-        .build()
-        .map_err(Into::into)
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Show keypress feedback (requires the overlay build feature)
+    #[arg(long)]
+    overlay: bool,
 }
 
-const EXIT_TIMEOUT: Duration = Duration::from_millis(2000);
-
 fn main() -> Result<()> {
-    let Ok(_lock) = acquire_singleton_lock() else {
+    let args = Args::parse();
+
+    #[cfg(not(feature = "overlay"))]
+    if args.overlay {
+        anyhow::bail!("Rebuild with `cargo build --features overlay` to use --overlay");
+    }
+
+    let Ok(lock) = acquire_singleton_lock() else {
         return Ok(());
     };
 
-    let mut keyboards = get_keyboards();
-    if keyboards.is_empty() {
-        anyhow::bail!("No keyboards found");
-    }
-
-    for keyboard in keyboards.iter_mut() {
-        keyboard.grab()?;
-    }
+    // Open input before configuration or graphics setup so early presses are queued
+    let keyboards = input::Keyboards::open()?;
 
     let config: Config<KeyConfig> = Config::new(ConfigPath::System("keyrun"))?;
-    let config_keys = config.read()?.keys;
+    let config = config.read()?;
+    let timeout = config.timeout()?;
+    let config_keys = config.keys;
+
     for command in config_keys.values() {
         for key in &command.links_with {
             anyhow::ensure!(
@@ -184,87 +224,122 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut vdev = build_virtual_device(&keyboards)?;
+    let run_listener = move |feedback| {
+        let result = listen(feedback, keyboards, config_keys, timeout);
 
-    let sys_path = vdev.get_syspath()?;
-    let now = Instant::now();
-    for _ in 0..50 {
-        if let Ok(d) = UDevDevice::from_syspath(&sys_path)
-            && d.is_initialized()
-        {
-            break;
+        // The listener has released its keyboards; allow another invocation
+        // while this overlay finishes its closing animation.
+        drop(lock);
+
+        result
+    };
+
+    #[cfg(feature = "overlay")]
+    if args.overlay {
+        return overlay::run(config.overlay, run_listener);
+    }
+
+    run_listener(None)
+}
+
+#[cfg_attr(not(feature = "overlay"), allow(dead_code))]
+struct KeyFeedback {
+    key: KeyCode,
+    valid: bool,
+    command: Option<String>,
+    remaining: Option<usize>,
+}
+
+struct Feedback {
+    tx: mpsc::Sender<KeyFeedback>,
+    #[cfg(feature = "overlay")]
+    context: std::sync::Arc<std::sync::OnceLock<eframe::egui::Context>>,
+}
+
+impl Feedback {
+    fn send(&self, event: KeyFeedback) -> Result<(), mpsc::SendError<KeyFeedback>> {
+        self.tx.send(event)?;
+
+        #[cfg(feature = "overlay")]
+        if let Some(context) = self.context.get() {
+            context.request_repaint();
         }
-        thread::sleep(Duration::from_millis(10));
+
+        Ok(())
     }
-    println!(
-        "Took {}ms to initialize virtual keyboard",
-        now.elapsed().as_millis()
-    );
+}
 
-    println!("Listening for keyboard events...");
+fn listen(
+    feedback: Option<Feedback>,
+    mut keyboards: input::Keyboards,
+    config_keys: HashMap<char, KeyCommand>,
+    timeout: Duration,
+) -> Result<()> {
+    let mut passthrough = passthrough::Passthrough::new(keyboards.devices())?;
 
-    let (tx, rx) = mpsc::channel();
+    run_session(
+        feedback,
+        &config_keys,
+        timeout,
+        |wait| keyboards.next(wait),
+        |events| passthrough.emit(events),
+    )
+}
 
-    for mut keyboard in keyboards {
-        let tx = tx.clone();
-
-        thread::spawn(move || {
-            loop {
-                match keyboard.fetch_events() {
-                    Ok(events) => {
-                        for event in events {
-                            if tx.send(event).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("keyboard error: {e}");
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    drop(tx);
-
+fn run_session(
+    feedback: Option<Feedback>,
+    config_keys: &HashMap<char, KeyCommand>,
+    timeout: Duration,
+    mut next: impl FnMut(Option<Duration>) -> Result<Option<input::Event>>,
+    mut emit: impl FnMut(&[evdev::InputEvent]) -> Result<()>,
+) -> Result<()> {
     let mut batch = Vec::new();
     let mut sinked_keys = Vec::new();
     let mut held_keys = Vec::new();
     let mut finished = false;
     let mut session: Option<KeySession> = None;
-    let mut deadline = Instant::now() + EXIT_TIMEOUT;
+    let mut deadline = Instant::now()
+        .checked_add(timeout)
+        .context("timeout_seconds is too large")?;
 
     loop {
-        let event = if held_keys.is_empty() {
-            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .ok()
+        let wait = if held_keys.is_empty() && sinked_keys.is_empty() {
+            Some(deadline.saturating_duration_since(Instant::now()))
         } else {
-            rx.recv().ok()
+            None
         };
-
-        let Some(event) = event else { break };
+        let Some(input::Event {
+            input: event,
+            source,
+            captured,
+        }) = next(wait)?
+        else {
+            break;
+        };
 
         match event.destructure() {
             EventSummary::Synchronization(..) => {
                 if !batch.is_empty() {
-                    vdev.emit(&batch)?;
+                    emit(&batch)?;
                     batch.clear();
                 }
+
                 if finished && sinked_keys.is_empty() && held_keys.is_empty() {
                     break;
                 }
             }
 
             // release sinked
-            EventSummary::Key(_, key, 0) if sinked_keys.contains(&key) => {
-                sinked_keys.retain(|held| *held != key);
+            EventSummary::Key(_, key, 0) if sinked_keys.contains(&(source, key)) => {
+                sinked_keys.retain(|held| *held != (source, key));
             }
 
             EventSummary::Key(_, key, 0) => {
-                held_keys.retain(|held| *held != key);
-                batch.push(event);
+                held_keys.retain(|held| *held != (source, key));
+
+                if captured {
+                    batch.push(event);
+                }
             }
 
             // press
@@ -274,36 +349,62 @@ fn main() -> Result<()> {
                     && let Some(key_cmd) = config_keys.get(&key_char)
                     && session.as_ref().is_none_or(|s| s.contains(key_char))
                 {
-                    if !sinked_keys.contains(&key) {
-                        sinked_keys.push(key);
+                    if captured && !sinked_keys.contains(&(source, key)) {
+                        sinked_keys.push((source, key));
                     }
 
-                    finished = session
-                        .get_or_insert_with(|| KeySession::new(key_char, key_cmd))
-                        .pressed();
+                    let active = session.get_or_insert_with(|| KeySession::new(key_char, key_cmd));
+                    finished = active.pressed();
 
-                    deadline = Instant::now() + EXIT_TIMEOUT;
+                    if let Some(tx) = &feedback {
+                        let _ = tx.send(KeyFeedback {
+                            key,
+                            valid: true,
+                            command: Some(key_cmd.label()),
+                            remaining: active.remaining,
+                        });
+                    }
+
+                    deadline = Instant::now()
+                        .checked_add(timeout)
+                        .context("timeout_seconds is too large")?;
 
                     if let Err(error) = key_cmd.build().and_then(|mut app| app.spawn()) {
                         eprintln!("command failed: {error:#}")
                     }
                 } else {
+                    if !finished && let Some(tx) = &feedback {
+                        let _ = tx.send(KeyFeedback {
+                            key,
+                            valid: false,
+                            command: None,
+                            remaining: None,
+                        });
+                    }
+
                     if !finished && session.is_some() {
                         finished = true;
                     }
-                    if !held_keys.contains(&key) {
-                        held_keys.push(key);
+
+                    if captured {
+                        if !held_keys.contains(&(source, key)) {
+                            held_keys.push((source, key));
+                        }
+
+                        batch.push(event);
                     }
-                    batch.push(event);
                 }
             }
-            _ => batch.push(event),
+            EventSummary::Key(_, key, 2) if sinked_keys.contains(&(source, key)) => {}
+            _ if captured => batch.push(event),
+            _ => {}
         }
     }
 
     if !batch.is_empty() {
-        vdev.emit(&batch)?;
+        emit(&batch)?;
     }
+
     Ok(())
 }
 
@@ -311,89 +412,102 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn repeat_count_defaults_and_validation() {
-        let default: KeyCommand = toml::from_str(
-            r#"
-            app = "true"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(default.times, ListenTimes::default());
-        let repeated: KeyCommand = toml::from_str(
-            r#"
-            app = "true"
-            times = 10
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            repeated.times,
-            ListenTimes::Limited(std::num::NonZeroUsize::new(10).unwrap())
-        );
-        assert!(toml::from_str::<KeyCommand>("app = 'true'\ntimes = 0").is_err());
-    }
-
-    #[test]
-    fn session_uses_starting_limit_and_direct_links() {
-        let config: KeyConfig = toml::from_str(
-            r#"
-            [keys.u]
-            app = "true"
-            times = 3
-            links_with = ["d"]
-
-            [keys.d]
-            app = "false"
-            links_with = ["u"]
-            times = 10
-            "#,
-        )
-        .unwrap();
-        let mut session = KeySession::new('u', &config.keys[&'u']);
-        assert!(session.contains('u'));
-        assert!(session.contains('d'));
-        assert!(!session.contains('x'));
-        assert!(!session.pressed());
-        assert!(!session.pressed());
-        assert!(session.pressed());
-        assert_eq!(KeySession::new('d', &config.keys[&'d']).remaining, Some(10));
-    }
-
-    #[test]
-    fn infinite_session_never_exhausts() {
-        let command = toml::from_str::<KeyCommand>(
-            r#"
-            app = "true"
-            times = "infinite"
-            "#,
-        )
-        .unwrap();
-
-        let mut session = KeySession::new('u', &command);
-
-        for _ in 0..1000 {
-            assert!(!session.pressed());
+    fn key_event(source: usize, key: KeyCode, value: i32, captured: bool) -> input::Event {
+        input::Event {
+            input: evdev::InputEvent::new(evdev::EventType::KEY.0, key.0, value),
+            source,
+            captured,
         }
+    }
 
-        assert_eq!(session.remaining, None);
+    fn sync_event(source: usize, captured: bool) -> input::Event {
+        input::Event {
+            input: evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0),
+            source,
+            captured,
+        }
+    }
+
+    #[test]
+    fn mapped_press_repeats_and_release_are_consumed_on_the_same_keyboard() {
+        let config: KeyConfig = toml::from_str("[keys.s]\napp='true'").unwrap();
+        let mut events = std::collections::VecDeque::from([
+            key_event(0, KeyCode::KEY_S, 1, true),
+            key_event(0, KeyCode::KEY_S, 2, true),
+            key_event(1, KeyCode::KEY_S, 0, false),
+            sync_event(1, false),
+            key_event(0, KeyCode::KEY_S, 0, true),
+            sync_event(0, true),
+        ]);
+        let mut forwarded = Vec::new();
+        let mut waits = Vec::new();
+
+        run_session(
+            None,
+            &config.keys,
+            Duration::from_millis(1),
+            |wait| {
+                waits.push(wait);
+                Ok(events.pop_front())
+            },
+            |batch| {
+                forwarded.extend_from_slice(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(events.is_empty(), "wait for the consumed key's own release");
         assert!(
-            toml::from_str::<KeyCommand>(
-                r#"
-                app = true
-                times = "what the"
-                "#
-            )
-            .is_err()
+            forwarded.is_empty(),
+            "consumed repeats must never reach uinput"
+        );
+        assert!(
+            waits[1..waits.len() - 1].iter().all(Option::is_none),
+            "a held key must survive the idle timeout"
         );
     }
 
     #[test]
-    fn named_keys_do_not_match_letter_bindings() {
-        assert_eq!(key_to_char(KeyCode::KEY_F), Some('f'));
-        assert_eq!(key_to_char(KeyCode::KEY_1), Some('1'));
-        assert_eq!(key_to_char(KeyCode::KEY_F1), None);
-        assert_eq!(key_to_char(KeyCode::KEY_ENTER), None);
-        assert_eq!(key_to_char(KeyCode::KEY_VOLUMEUP), None);
+    fn native_startup_press_runs_once_without_replaying_its_events() {
+        for release_captured in [false, true] {
+            let config: KeyConfig = toml::from_str("[keys.s]\napp='true'").unwrap();
+            let mut events = std::collections::VecDeque::from([
+                key_event(0, KeyCode::KEY_S, 1, false),
+                key_event(0, KeyCode::KEY_S, 2, false),
+                key_event(0, KeyCode::KEY_S, 0, release_captured),
+                sync_event(0, release_captured),
+            ]);
+            let (tx, rx) = mpsc::channel();
+            let feedback = Feedback {
+                tx,
+                #[cfg(feature = "overlay")]
+                context: std::sync::Arc::new(std::sync::OnceLock::new()),
+            };
+            let mut forwarded = Vec::new();
+
+            run_session(
+                Some(feedback),
+                &config.keys,
+                Duration::from_secs(1),
+                |_| Ok(events.pop_front()),
+                |batch| {
+                    forwarded.extend_from_slice(batch);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            let feedback = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(feedback.len(), 1);
+            assert!(feedback[0].valid);
+            assert_eq!(feedback[0].key, KeyCode::KEY_S);
+            let expected = if release_captured {
+                vec![key_event(0, KeyCode::KEY_S, 0, true).input]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(forwarded, expected, "forward only the captured release");
+        }
     }
 }

@@ -1,0 +1,124 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"title": "keyrun configuration",
+	"description": "Key bindings and optional overlay settings for keyrun.",
+	"type": "object",
+	"required": [
+		"keys"
+	],
+	"additionalProperties": false,
+	"properties": {
+		"timeout_seconds": {
+			"description": "Positive, finite idle timeout in seconds; fractional seconds are supported. Set at the root, before TOML tables. Resets after every accepted press. Forwarded keys are released before exiting.",
+			"type": "number",
+			"exclusiveMinimum": 0,
+			"default": 1.0
+		},
+		"keys": {
+			"description": "Commands indexed by a single key, normally a lowercase letter or digit.",
+			"type": "object",
+			"propertyNames": {
+				"minLength": 1,
+				"maxLength": 1
+			},
+			"additionalProperties": {
+				"$ref": "#/definitions/command"
+			}
+		},
+		"overlay": {
+			"description": "Appearance settings used with --overlay (requires the overlay build feature).",
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"window_background_opacity": {
+					"description": "Whole-window background opacity: 0 is transparent, 1 is opaque. Text is unaffected.",
+					"type": "number",
+					"minimum": 0,
+					"maximum": 1,
+					"default": 0.0
+				},
+				"row_background_opacity": {
+					"description": "Notification background opacity: 0 is transparent, 1 is opaque. Text is unaffected.",
+					"type": "number",
+					"minimum": 0,
+					"maximum": 1,
+					"default": 1.0
+				},
+				"row_borders": {
+					"description": "Show notification borders. The compositor's outer border is controlled separately.",
+					"type": "boolean",
+					"default": true
+				},
+				"show_command": {
+					"description": "Show the command and arguments below the key, with a red remaining-press countdown for finite sessions or repeat count for infinite sessions. When false, the command and countdown are hidden; infinite repeat counts stay beside the key.",
+					"type": "boolean",
+					"default": true
+				}
+			}
+		}
+	},
+	"definitions": {
+		"command": {
+			"type": "object",
+			"required": [
+				"app"
+			],
+			"additionalProperties": false,
+			"properties": {
+				"app": {
+					"description": "Executable name or path.",
+					"type": "string"
+				},
+				"args": {
+					"description": "Arguments passed directly to the executable, without shell expansion.",
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"env": {
+					"description": "Environment variables as name/value pairs, for example [[\"NAME\", \"value\"]].",
+					"type": "array",
+					"items": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						},
+						"minItems": 2,
+						"maxItems": 2
+					}
+				},
+				"times": {
+					"description": "Total accepted presses, including the first. Defaults to one press. The starting binding sets the shared limit for its directly linked keys. Infinite sessions still stop on idle or an unrelated key.",
+					"default": 1,
+					"oneOf": [
+						{
+							"type": "integer",
+							"minimum": 1
+						},
+						{
+							"type": "string",
+							"enum": [
+								"infinite"
+							]
+						}
+					]
+				},
+				"links_with": {
+					"description": "Other configured keys allowed in this session. Only the starting binding's direct links apply; list links on both sides to start from either key. Targets must exist under keys.",
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 1
+					},
+					"default": []
+				},
+				"pipe": {
+					"description": "Another command connected by a pipe. Commands can be nested.",
+					"$ref": "#/definitions/command"
+				}
+			}
+		}
+	}
+}
