@@ -3,8 +3,27 @@ name: Rust
 on:
   push:
     branches:
-      - "**"
+      - main
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain*"
+      - ".github/workflows/rust.yml"
   pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain*"
+      - ".github/workflows/rust.yml"
+
+env:
+  CARGO_TERM_COLOR: always
 
 permissions:
   contents: read
@@ -30,14 +49,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Clippy without overlay
-        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
-
-      - name: Clippy with overlay
+      - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Test without overlay
-        run: cargo test --locked --no-default-features
+      - name: Build
+        run: cargo build --locked --all-features
 
-      - name: Test with overlay
+      - name: Run tests
         run: cargo test --locked --all-features
