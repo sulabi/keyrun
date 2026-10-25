@@ -30,9 +30,41 @@ impl Default for KeyCommand {
     }
 }
 
-#[derive(Deserialize, Serialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 struct KeyConfig {
+    #[serde(default = "default_timeout_seconds")]
+    timeout_seconds: f64,
     keys: HashMap<char, KeyCommand>,
+}
+
+fn default_timeout_seconds() -> f64 {
+    1.0
+}
+
+impl Default for KeyConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: default_timeout_seconds(),
+            keys: HashMap::new(),
+        }
+    }
+}
+
+impl KeyConfig {
+    fn timeout(&self) -> Result<Duration> {
+        let timeout = Duration::try_from_secs_f64(self.timeout_seconds)
+            .context("timeout_seconds must be a finite, positive number")?;
+
+        anyhow::ensure!(
+            !timeout.is_zero(),
+            "timeout_seconds must be greater than zero"
+        );
+        Instant::now()
+            .checked_add(timeout)
+            .context("timeout_seconds is too large")?;
+
+        Ok(timeout)
+    }
 }
 
 impl KeyCommand {
@@ -110,20 +142,15 @@ fn build_virtual_device(keyboards: &[Device]) -> Result<VirtualDevice> {
     Ok(vdev)
 }
 
-const EXIT_TIMEOUT: Duration = Duration::from_millis(2000);
-
 fn main() -> Result<()> {
     let Ok(_lock) = acquire_singleton_lock() else {
         return Ok(());
     };
 
-    thread::spawn(move || {
-        thread::sleep(EXIT_TIMEOUT);
-        std::process::exit(1);
-    });
-
     let config: Config<KeyConfig> = Config::new(ConfigDirectory::System("keyrun"))?;
-    let config_keys = config.read()?.keys;
+    let config = config.read()?;
+    let timeout = config.timeout()?;
+    let config_keys = config.keys;
 
     let mut keyboards = get_keyboards();
     if keyboards.is_empty() {
@@ -180,8 +207,9 @@ fn main() -> Result<()> {
     drop(tx);
 
     let mut batch = Vec::new();
+    let deadline = Instant::now() + timeout;
 
-    for event in rx {
+    while let Ok(event) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         match event.destructure() {
             EventSummary::Synchronization(..) => {
                 if !batch.is_empty() {

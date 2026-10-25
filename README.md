@@ -6,8 +6,11 @@
 
 `keyrun` reads a config file from `~/.config/keyrun/config.toml`. The config is written in a toml format for clear mappings.
 
+`timeout_seconds` sets how long to wait for a key, starting after keyboard setup. (default: 1)
+
 ### Config example
 ```toml
+timeout_seconds = 1
 
 # Single app
 [keys.f]
