@@ -1,6 +1,6 @@
 use crate::command::Command;
 use anyhow::{Context, Result};
-use configfs::{Config, ConfigDirectory};
+use configfs::{Config, ConfigPath};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -74,7 +74,7 @@ impl Default for KeyConfig {
 
 impl KeyConfig {
     pub(crate) fn read() -> Result<Self> {
-        let config: Config<Self> = Config::new(ConfigDirectory::System("keyrun"))?;
+        let config: Config<Self> = Config::new(ConfigPath::System("keyrun"))?;
         let config = config.read()?;
 
         for command in config.keys.values() {
