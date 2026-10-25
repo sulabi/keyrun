@@ -13,6 +13,8 @@ use command::*;
 #[derive(Deserialize, Serialize, Debug)]
 struct KeyCommand {
     app: String,
+    #[serde(default)]
+    times: ListenTimes,
     args: Option<Vec<String>>,
     env: Option<Vec<(String, String)>>,
 
@@ -23,9 +25,55 @@ impl Default for KeyCommand {
     fn default() -> Self {
         Self {
             app: "".to_string(),
+            times: ListenTimes::default(),
             args: None,
             env: None,
             pipe: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Unlimited {
+    Infinite,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(untagged)]
+enum ListenTimes {
+    Limited(std::num::NonZeroUsize),
+    Unlimited(Unlimited),
+}
+
+impl Default for ListenTimes {
+    fn default() -> Self {
+        Self::Limited(std::num::NonZeroUsize::new(1).unwrap())
+    }
+}
+
+struct Session {
+    key: char,
+    remaining: Option<usize>,
+}
+
+impl Session {
+    fn new(key: char, command: &KeyCommand) -> Self {
+        Self {
+            key,
+            remaining: match command.times {
+                ListenTimes::Limited(count) => Some(count.get()),
+                ListenTimes::Unlimited(_) => None,
+            },
+        }
+    }
+
+    fn pressed(&mut self) -> bool {
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= 1;
+            *remaining == 0
+        } else {
+            false
         }
     }
 }
@@ -120,10 +168,11 @@ fn acquire_singleton_lock() -> Result<std::fs::File> {
 
 fn key_to_char(key: KeyCode) -> Option<char> {
     let name = format!("{key:?}");
-    name.strip_prefix("KEY_")?
-        .chars()
-        .next()
-        .map(|c| c.to_ascii_lowercase())
+    let name = name.strip_prefix("KEY_")?;
+
+    (name.len() == 1)
+        .then(|| name.chars().next().map(|c| c.to_ascii_lowercase()))
+        .flatten()
 }
 
 fn build_virtual_device(keyboards: &[Device]) -> Result<VirtualDevice> {
@@ -182,7 +231,7 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
 
-    for mut keyboard in keyboards {
+    for (source, mut keyboard) in keyboards.into_iter().enumerate() {
         let tx = tx.clone();
 
         thread::spawn(move || {
@@ -190,7 +239,7 @@ fn main() -> Result<()> {
                 match keyboard.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            if tx.send(event).is_err() {
+                            if tx.send((source, event)).is_err() {
                                 return;
                             }
                         }
@@ -206,28 +255,89 @@ fn main() -> Result<()> {
 
     drop(tx);
 
-    let mut batch = Vec::new();
-    let deadline = Instant::now() + timeout;
+    listen(&rx, &config_keys, timeout, |batch| {
+        vdev.emit(batch).map_err(Into::into)
+    })
+}
 
-    while let Ok(event) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+fn listen(
+    rx: &mpsc::Receiver<(usize, evdev::InputEvent)>,
+    config_keys: &HashMap<char, KeyCommand>,
+    timeout: Duration,
+    mut emit: impl FnMut(&[evdev::InputEvent]) -> Result<()>,
+) -> Result<()> {
+    let mut batch = Vec::new();
+    let mut consumed = Vec::new();
+    let mut held = Vec::new();
+    let mut session: Option<Session> = None;
+    let mut finished = false;
+    let mut deadline = Instant::now() + timeout;
+
+    loop {
+        let input = if consumed.is_empty() && held.is_empty() {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        } else {
+            rx.recv().ok()
+        };
+
+        let Some((source, event)) = input else { break };
+
         match event.destructure() {
             EventSummary::Synchronization(..) => {
                 if !batch.is_empty() {
-                    vdev.emit(&batch)?;
+                    emit(&batch)?;
                     batch.clear();
                 }
+
+                if finished && consumed.is_empty() && held.is_empty() {
+                    break;
+                }
+            }
+            EventSummary::Key(_, key, 0) if consumed.contains(&(source, key)) => {
+                consumed.retain(|held| *held != (source, key));
+            }
+            EventSummary::Key(_, key, 0) => {
+                held.retain(|held| *held != (source, key));
+                batch.push(event);
             }
             EventSummary::Key(_, key, 1) => {
-                if let Some(key_char) = key_to_char(key)
+                if !finished
+                    && let Some(key_char) = key_to_char(key)
                     && let Some(key_cmd) = config_keys.get(&key_char)
-                    && let Ok(mut app) = key_cmd.build()
+                    && session
+                        .as_ref()
+                        .is_none_or(|session| session.key == key_char)
                 {
-                    let _ = app.spawn();
+                    if !consumed.contains(&(source, key)) {
+                        consumed.push((source, key));
+                    }
+
+                    finished = session
+                        .get_or_insert_with(|| Session::new(key_char, key_cmd))
+                        .pressed();
+                    deadline = Instant::now() + timeout;
+
+                    if let Err(error) = key_cmd.build().and_then(|mut app| app.spawn()) {
+                        eprintln!("command failed: {error:#}");
+                    }
+                } else {
+                    finished |= session.is_some();
+
+                    if !held.contains(&(source, key)) {
+                        held.push((source, key));
+                    }
+
+                    batch.push(event);
                 }
-                std::process::exit(0);
             }
+            EventSummary::Key(_, key, 2) if consumed.contains(&(source, key)) => {}
             _ => batch.push(event),
         }
+    }
+
+    if !batch.is_empty() {
+        emit(&batch)?;
     }
 
     Ok(())
